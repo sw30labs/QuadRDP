@@ -1,0 +1,8 @@
+build/
+.local-data/
+.DS_Store
+.env
+.env.*
+*.pem
+*.key
+profiles.json
