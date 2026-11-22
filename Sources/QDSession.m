@@ -5,7 +5,13 @@
 #pragma clang diagnostic ignored "-Wmacro-redefined"
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #include <freerdp/freerdp.h>
+#include <freerdp/addin.h>
+#include <freerdp/client/channels.h>
+#include <freerdp/client/cmdline.h>
+#include <freerdp/client/rdpgfx.h>
+#include <freerdp/channels/channels.h>
 #include <freerdp/gdi/gdi.h>
+#include <freerdp/gdi/gfx.h>
 #include <freerdp/graphics.h>
 #include <freerdp/input.h>
 #include <freerdp/settings.h>
@@ -113,6 +119,33 @@ static BOOL PostConnect(freerdp *instance) {
 }
 static void PostDisconnect(freerdp *instance) {
     if (instance->context->gdi) gdi_free(instance);
+}
+static BOOL LoadChannels(freerdp *instance) {
+    rdpContext *c = instance->context;
+    rdpSettings *s = c->settings;
+    const char *args[] = { "rdpgfx" };
+    // Load only graphics, without the general client's clipboard/audio/device defaults.
+    if (!freerdp_dynamic_channel_collection_find(s, args[0]) &&
+        !freerdp_client_add_dynamic_channel(s, 1, args)) return FALSE;
+    if (!freerdp_settings_set_bool(s, FreeRDP_SupportDynamicChannels, TRUE)) return FALSE;
+    PVIRTUALCHANNELENTRY entry = freerdp_load_channel_addin_entry("drdynvc", NULL, NULL,
+        FREERDP_ADDIN_CHANNEL_STATIC | FREERDP_ADDIN_CHANNEL_ENTRYEX);
+    if (entry)
+        return freerdp_channels_client_load_ex(c->channels, s,
+            WINPR_FUNC_PTR_CAST(entry, PVIRTUALCHANNELENTRYEX), s) == CHANNEL_RC_OK;
+    entry = freerdp_load_channel_addin_entry("drdynvc", NULL, NULL, FREERDP_ADDIN_CHANNEL_STATIC);
+    return entry && freerdp_channels_client_load(c->channels, s, entry, s) == CHANNEL_RC_OK;
+}
+static void ChannelConnected(void *context, const ChannelConnectedEventArgs *event) {
+    rdpContext *c = context;
+    if (strcmp(event->name, RDPGFX_DVC_CHANNEL_NAME) == 0 &&
+        (!c->gdi || !gdi_graphics_pipeline_init(c->gdi, (RdpgfxClientContext *)event->pInterface)))
+        setChannelError(c, ERROR_INTERNAL_ERROR, "Could not initialize the graphics pipeline.");
+}
+static void ChannelDisconnected(void *context, const ChannelDisconnectedEventArgs *event) {
+    rdpContext *c = context;
+    if (c->gdi && strcmp(event->name, RDPGFX_DVC_CHANNEL_NAME) == 0)
+        gdi_graphics_pipeline_uninit(c->gdi, (RdpgfxClientContext *)event->pInterface);
 }
 static BOOL Authenticate(freerdp *instance, char **username, char **password, char **domain, rdp_auth_reason reason) {
     // Credentials were supplied before connect. Re-prompting is an explicit profile edit/retry.
@@ -236,10 +269,22 @@ static DWORD VerifyChanged(freerdp *instance, const char *host, UINT16 port, con
     if (!instance) { [self notifyState:QDFailed message:@"Could not allocate FreeRDP."]; return; }
     instance->ContextSize = sizeof(QDContext);
     instance->PostConnect = PostConnect; instance->PostDisconnect = PostDisconnect;
+    instance->LoadChannels = LoadChannels;
     instance->VerifyCertificateEx = Verify; instance->VerifyChangedCertificateEx = VerifyChanged;
     instance->AuthenticateEx = Authenticate;
     if (!freerdp_context_new(instance)) { freerdp_free(instance); [self notifyState:QDFailed message:@"Could not initialize FreeRDP."]; return; }
     ((QDContext *)instance->context)->owner = (__bridge void *)self;
+    // GNOME Remote Login requires the graphics channel. Bind its software
+    // renderer once per context; FreeRDP reloads channels on redirection.
+    static dispatch_once_t addinOnce;
+    static BOOL addinsReady;
+    dispatch_once(&addinOnce, ^{
+        addinsReady = freerdp_register_addin_provider(freerdp_channels_load_static_addin_entry, 0) == CHANNEL_RC_OK;
+    });
+    if (!addinsReady ||
+        PubSub_SubscribeChannelConnected(instance->context->pubSub, ChannelConnected) < 0 ||
+        PubSub_SubscribeChannelDisconnected(instance->context->pubSub, ChannelDisconnected) < 0)
+        failure = @"Could not initialize remote desktop channels.";
     rdpSettings *s = instance->context->settings;
     NSURL *certs = [QDDataDirectory() URLByAppendingPathComponent:@"freerdp" isDirectory:YES];
     NSError *fileError = nil;
@@ -267,7 +312,12 @@ static DWORD VerifyChanged(freerdp *instance, const char *host, UINT16 port, con
         freerdp_settings_set_bool(s, FreeRDP_TlsSecurity, !profile.useNLA) &&
         freerdp_settings_set_bool(s, FreeRDP_RdpSecurity, FALSE) &&
         freerdp_settings_set_bool(s, FreeRDP_SoftwareGdi, TRUE) &&
-        freerdp_settings_set_bool(s, FreeRDP_SupportGraphicsPipeline, FALSE) &&
+        freerdp_settings_set_bool(s, FreeRDP_SupportGraphicsPipeline, TRUE) &&
+        freerdp_settings_set_bool(s, FreeRDP_GfxH264, FALSE) &&
+        freerdp_settings_set_bool(s, FreeRDP_GfxAVC444, FALSE) &&
+        freerdp_settings_set_bool(s, FreeRDP_GfxAVC444v2, FALSE) &&
+        freerdp_settings_set_bool(s, FreeRDP_FastPathOutput, TRUE) &&
+        freerdp_settings_set_bool(s, FreeRDP_FrameMarkerCommandEnabled, TRUE) &&
         freerdp_settings_set_bool(s, FreeRDP_RemoteFxCodec, FALSE) &&
         freerdp_settings_set_bool(s, FreeRDP_NSCodec, TRUE) &&
         freerdp_settings_set_bool(s, FreeRDP_AudioPlayback, FALSE) &&

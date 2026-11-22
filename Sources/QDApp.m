@@ -3,6 +3,8 @@
 #import "QDProfile.h"
 #import <QuartzCore/QuartzCore.h>
 
+static NSString *const QDAutoConnectOnLaunch = @"AutoConnectOnLaunch";
+
 static NSColor *Accent(void) { return [NSColor colorWithSRGBRed:0.35 green:0.84 blue:0.70 alpha:1]; }
 static NSTextField *Label(NSString *text, CGFloat size, NSFontWeight weight) {
     NSTextField *label = [NSTextField labelWithString:text];
@@ -44,12 +46,20 @@ static NSButton *Button(NSString *title, id target, SEL action) {
 }
 @end
 
+@interface QDConnectionRequest : NSObject
+@property (atomic) BOOL cancelled;
+@property NSString *status; // Main-thread UI state; cancellation is shared with the worker.
+@end
+@implementation QDConnectionRequest
+@end
+
 @interface QDTile : QDFlippedView
 @property QDDesktopView *desktop;
 @property NSTextField *nameLabel, *statusLabel, *indexLabel;
 @property NSButton *connectButton, *editButton, *zoomButton, *secureButton;
 @property QDProfile *profile;
 @property QDSession *session;
+@property QDConnectionRequest *connectionRequest;
 @property (nonatomic) BOOL selected;
 - (void)refresh;
 @end
@@ -94,22 +104,24 @@ static NSButton *Button(NSString *title, id target, SEL action) {
 - (void)setSelected:(BOOL)selected { _selected = selected; [self refresh]; }
 - (void)refresh {
     QDSessionState state = self.session.state;
-    BOOL busy = state == QDConnecting || state == QDConnected || state == QDStopping;
+    BOOL pending = self.connectionRequest != nil;
+    BOOL busy = pending || state == QDConnecting || state == QDConnected || state == QDStopping;
     _nameLabel.stringValue = self.profile.name.length ? self.profile.name : self.profile.host;
-    _statusLabel.stringValue = self.profile.host.length ? self.session.status : @"Not configured";
-    _statusLabel.textColor = state == QDConnected ? Accent() : state == QDFailed ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor;
-    _statusLabel.toolTip = self.session.status;
-    _connectButton.title = state == QDConnected ? @"Disconnect" : state == QDConnecting ? @"Cancel" : state == QDStopping ? @"Stopping…" : @"Connect";
+    NSString *status = pending ? self.connectionRequest.status : self.session.status;
+    _statusLabel.stringValue = self.profile.host.length ? status : @"Not configured";
+    _statusLabel.textColor = !pending && state == QDConnected ? Accent() : !pending && state == QDFailed ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor;
+    _statusLabel.toolTip = status;
+    _connectButton.title = pending ? @"Cancel" : state == QDConnected ? @"Disconnect" : state == QDConnecting ? @"Cancel" : state == QDStopping ? @"Stopping…" : @"Connect";
     _connectButton.enabled = state != QDStopping;
     _editButton.enabled = !busy;
     _secureButton.enabled = state == QDConnected;
     self.layer.borderColor = self.selected ? Accent().CGColor : [NSColor colorWithWhite:0.21 alpha:1].CGColor;
     self.layer.borderWidth = self.selected ? 2 : 1;
-    _desktop.placeholderTitle = state == QDConnecting ? @"Connecting…" : state == QDFailed ? @"Couldn’t connect" : self.profile.host.length ? self.profile.name : @"Add a computer";
-    _desktop.placeholderDetail = state == QDFailed ? self.session.status : self.profile.host.length ?
+    _desktop.placeholderTitle = pending ? status : state == QDConnecting ? @"Connecting…" : state == QDFailed ? @"Couldn’t connect" : self.profile.host.length ? self.profile.name : @"Add a computer";
+    _desktop.placeholderDetail = pending ? @"Check for a macOS Keychain prompt. You can cancel this connection while waiting." : state == QDFailed ? self.session.status : self.profile.host.length ?
         [NSString stringWithFormat:@"%@:%ld  ·  %@\nClick Connect when you’re ready.", self.profile.host, (long)self.profile.port, self.profile.username] :
         @"Click the gear to add a hostname and account.";
-    _desktop.accessibilityLabel = [NSString stringWithFormat:@"%@ remote desktop. %@", self.profile.name, self.session.status];
+    _desktop.accessibilityLabel = [NSString stringWithFormat:@"%@ remote desktop. %@", self.profile.name, status];
     _desktop.needsDisplay = YES;
 }
 @end
@@ -153,10 +165,17 @@ static NSButton *Button(NSString *title, id target, SEL action) {
 @property NSMutableArray<void (^)(void)> *prompts;
 @property NSAlert *activeAlert;
 @property QDSession *activeAlertSession;
+@property QDConnectionRequest *activeAlertRequest;
+@property dispatch_queue_t credentialQueue;
 @property BOOL quitting, profileLoadFailed;
 @end
 
 @implementation QDApp
+- (instancetype)init {
+    if ((self = [super init]))
+        _credentialQueue = dispatch_queue_create("local.quadrdp.credentials", DISPATCH_QUEUE_SERIAL);
+    return self;
+}
 - (void)applicationDidFinishLaunching:(NSNotification *)note {
     // Refresh the running Dock tile even if macOS cached the pre-icon bundle.
     NSURL *iconURL = [NSBundle.mainBundle URLForResource:@"QuadRDP" withExtension:@"icns"];
@@ -230,6 +249,7 @@ static NSButton *Button(NSString *title, id target, SEL action) {
     }];
     [NSRunLoop.mainRunLoop addTimer:self.timer forMode:NSRunLoopCommonModes];
     if (loadError) [self showError:loadError.localizedDescription];
+    dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf connectOnLaunch]; });
 }
 - (void)installMenu {
     NSMenu *main = [NSMenu new]; NSMenuItem *appItem = [NSMenuItem new]; [main addItem:appItem];
@@ -237,6 +257,10 @@ static NSButton *Button(NSString *title, id target, SEL action) {
     NSMenuItem *about = [[NSMenuItem alloc] initWithTitle:@"About QuadRDP" action:@selector(about:) keyEquivalent:@""]; about.target = self; [app addItem:about];
     [app addItem:NSMenuItem.separatorItem];
     NSMenuItem *settings = [[NSMenuItem alloc] initWithTitle:@"Configure Selected Computer…" action:@selector(editSelected:) keyEquivalent:@","]; settings.target=self; [app addItem:settings];
+    NSMenuItem *autoConnect = [[NSMenuItem alloc] initWithTitle:@"Connect Automatically on Launch" action:@selector(toggleAutoConnectOnLaunch:) keyEquivalent:@""];
+    autoConnect.target = self;
+    autoConnect.state = [NSUserDefaults.standardUserDefaults boolForKey:QDAutoConnectOnLaunch] ? NSControlStateValueOn : NSControlStateValueOff;
+    [app addItem:autoConnect];
     [app addItem:NSMenuItem.separatorItem];
     [app addItemWithTitle:@"Quit QuadRDP" action:@selector(terminate:) keyEquivalent:@"q"];
     NSMenuItem *editItem=[NSMenuItem new]; editItem.title=@"Edit"; [main addItem:editItem];
@@ -264,15 +288,18 @@ static NSButton *Button(NSString *title, id target, SEL action) {
     [alert addButtonWithTitle:@"OK"]; [self present:alert session:nil completion:nil];
 }
 - (void)present:(NSAlert *)alert session:(QDSession *)session completion:(void (^)(NSModalResponse))completion {
+    [self present:alert session:session request:nil completion:completion];
+}
+- (void)present:(NSAlert *)alert session:(QDSession *)session request:(QDConnectionRequest *)request completion:(void (^)(NSModalResponse))completion {
     __weak QDApp *weakSelf=self;
     [self.prompts addObject:^{
         QDApp *app=weakSelf;
-        if (app.quitting || (session && (session.stopping || session.state != QDConnecting))) {
+        if (!app || app.quitting || request.cancelled || (session && (session.stopping || session.state != QDConnecting))) {
             if (completion) completion(NSModalResponseCancel); return;
         }
-        app.activeAlert=alert; app.activeAlertSession=session;
+        app.activeAlert=alert; app.activeAlertSession=session; app.activeAlertRequest=request;
         [alert beginSheetModalForWindow:app.window completionHandler:^(NSModalResponse response) {
-            app.activeAlert=nil; app.activeAlertSession=nil;
+            app.activeAlert=nil; app.activeAlertSession=nil; app.activeAlertRequest=nil;
             if (completion) completion(response);
         }];
     }];
@@ -312,51 +339,109 @@ static NSButton *Button(NSString *title, id target, SEL action) {
     [self.window makeFirstResponder:self.tiles[sender.tag].desktop];
 }
 - (void)connectAll:(id)sender {
+    if (![self connectConfiguredTiles]) [self editSelected:nil];
+}
+- (BOOL)connectConfiguredTiles {
     BOOL configured=NO;
     for (NSInteger i=0;i<4;i++) if (self.profiles[i].host.length) { configured=YES; [self connectTile:i]; }
-    if (!configured) [self editSelected:nil];
+    return configured;
+}
+- (void)connectOnLaunch {
+    if (self.quitting || self.profileLoadFailed || ![NSUserDefaults.standardUserDefaults boolForKey:QDAutoConnectOnLaunch]) return;
+    [self connectConfiguredTiles];
+}
+- (void)toggleAutoConnectOnLaunch:(NSMenuItem *)sender {
+    BOOL enabled = ![NSUserDefaults.standardUserDefaults boolForKey:QDAutoConnectOnLaunch];
+    [NSUserDefaults.standardUserDefaults setBool:enabled forKey:QDAutoConnectOnLaunch];
+    sender.state = enabled ? NSControlStateValueOn : NSControlStateValueOff;
 }
 - (void)disconnectAll:(id)sender {
-    for (QDTile *tile in self.tiles) { [tile.desktop releaseInputs]; [tile.session disconnect]; }
+    for (QDTile *tile in self.tiles) { [self cancelRequestForTile:tile]; [tile.desktop releaseInputs]; [tile.session disconnect]; }
+    [self refresh];
 }
 - (void)toggleConnection:(NSButton *)sender {
     QDTile *tile=self.tiles[sender.tag];
-    if (tile.session.state==QDConnecting || tile.session.state==QDConnected) { [tile.desktop releaseInputs]; [tile.session disconnect]; }
+    if (tile.connectionRequest || tile.session.state==QDConnecting || tile.session.state==QDConnected) {
+        [self cancelRequestForTile:tile]; [tile.desktop releaseInputs]; [tile.session disconnect]; [self refresh];
+    }
     else [self connectTile:sender.tag];
+}
+- (void)cancelRequestForTile:(QDTile *)tile {
+    QDConnectionRequest *request=tile.connectionRequest;
+    request.cancelled=YES; tile.connectionRequest=nil;
+    if (request && self.activeAlertRequest==request)
+        [self.window endSheet:self.activeAlert.window returnCode:NSModalResponseCancel];
+}
+- (BOOL)isCurrentRequest:(QDConnectionRequest *)request tile:(QDTile *)tile {
+    return !self.quitting && !request.cancelled && tile.connectionRequest==request;
+}
+- (NSString *)passwordForProfile:(QDProfile *)profile error:(NSError **)error {
+    return [profile password:error];
+}
+- (void)finishRequest:(QDConnectionRequest *)request tile:(QDTile *)tile profile:(QDProfile *)profile password:(NSString *)password error:(NSError *)error {
+    if (![self isCurrentRequest:request tile:tile]) return;
+    tile.connectionRequest=nil;
+    if (error) [self showError:error.localizedDescription];
+    else [tile.session connectProfile:profile password:password];
+    [self refresh];
 }
 - (void)connectTile:(NSInteger)index {
     QDTile *tile=self.tiles[index];
-    if (tile.session.state==QDConnecting || tile.session.state==QDConnected || tile.session.state==QDStopping) return;
+    if (self.quitting || tile.connectionRequest || tile.session.state==QDConnecting || tile.session.state==QDConnected || tile.session.state==QDStopping) return;
     if (!tile.profile.host.length) { [self editProfile:tile.editButton]; return; }
-    NSError *error=nil; NSString *password=[tile.profile password:&error];
-    if (error) { [self showError:error.localizedDescription]; return; }
-    if (password.length) { [tile.session connectProfile:tile.profile password:password]; return; }
-    NSAlert *alert=[NSAlert new]; alert.messageText=[@"Connect to " stringByAppendingString:tile.profile.name];
-    alert.informativeText=[NSString stringWithFormat:@"%@ · %@\nEnter the Windows account password (not a Windows Hello PIN).",tile.profile.host,tile.profile.username];
+    QDConnectionRequest *request=[QDConnectionRequest new]; request.status=@"Waiting for Keychain…";
+    tile.connectionRequest=request; [self refresh];
+    QDProfile *profile=[tile.profile copy];
+    __weak QDApp *weakSelf=self;
+    dispatch_async(self.credentialQueue, ^{
+        @autoreleasepool {
+            if (request.cancelled) return;
+            NSError *error=nil; NSString *password=[weakSelf passwordForProfile:profile error:&error];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                QDApp *app=weakSelf;
+                if (![app isCurrentRequest:request tile:tile]) return;
+                if (error || password.length) [app finishRequest:request tile:tile profile:profile password:password error:error];
+                else [app requestPasswordForTile:tile profile:profile request:request];
+            });
+        }
+    });
+}
+- (void)requestPasswordForTile:(QDTile *)tile profile:(QDProfile *)profile request:(QDConnectionRequest *)request {
+    request.status=@"Password required"; [self refresh];
+    NSAlert *alert=[NSAlert new]; alert.messageText=[@"Connect to " stringByAppendingString:profile.name];
+    alert.informativeText=[NSString stringWithFormat:@"%@ · %@\nEnter the password configured for this RDP connection. A remote login screen may ask for your computer account password afterward.",profile.host,profile.username];
     [alert addButtonWithTitle:@"Connect"]; [alert addButtonWithTitle:@"Cancel"];
     QDFlippedView *accessory=[[QDFlippedView alloc] initWithFrame:NSMakeRect(0,0,380,65)];
     NSSecureTextField *field=[[NSSecureTextField alloc] initWithFrame:NSMakeRect(0,0,380,26)];
     field.placeholderString=@"Password";
     NSButton *remember=[NSButton checkboxWithTitle:@"Save password in macOS Keychain" target:nil action:NULL]; remember.frame=NSMakeRect(0,36,380,22);
     [accessory addSubview:field]; [accessory addSubview:remember]; alert.accessoryView=accessory;
-    [self present:alert session:nil completion:^(NSModalResponse response) {
-        if (response!=NSAlertFirstButtonReturn || self.quitting) return;
+    [self present:alert session:nil request:request completion:^(NSModalResponse response) {
         NSString *secret=field.stringValue; field.stringValue=@"";
+        if (![self isCurrentRequest:request tile:tile]) return;
+        if (response!=NSAlertFirstButtonReturn) { [self cancelRequestForTile:tile]; [self refresh]; return; }
         if (remember.state==NSControlStateValueOn) {
-            NSError *writeError=nil;
-            if (![tile.profile savePassword:secret error:&writeError]) { [self showError:writeError.localizedDescription]; return; }
-        }
-        [tile.session connectProfile:tile.profile password:secret];
+            request.status=@"Waiting for Keychain…"; [self refresh];
+            dispatch_async(self.credentialQueue, ^{
+                @autoreleasepool {
+                    if (request.cancelled) return;
+                    NSError *writeError=nil; [profile savePassword:secret error:&writeError];
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [self finishRequest:request tile:tile profile:profile password:secret error:writeError];
+                    });
+                }
+            });
+        } else [self finishRequest:request tile:tile profile:profile password:secret error:nil];
     }];
 }
 - (void)editSelected:(id)sender { [self editProfile:self.tiles[self.selected].editButton]; }
 - (void)editProfile:(NSButton *)sender {
     if (self.profileLoadFailed) { [self showError:@"Fix the existing profiles.json file and relaunch before saving changes. Your original file has been preserved."]; return; }
     NSInteger index=sender.tag; QDTile *tile=self.tiles[index];
-    if (tile.session.state==QDConnected || tile.session.state==QDConnecting || tile.session.state==QDStopping) return;
+    if (self.quitting || tile.connectionRequest || tile.session.state==QDConnected || tile.session.state==QDConnecting || tile.session.state==QDStopping) return;
     QDProfile *draft=[tile.profile copy];
     NSAlert *alert=[NSAlert new]; alert.messageText=[NSString stringWithFormat:@"Configure computer %ld", (long)index+1];
-    alert.informativeText=@"Set up the Windows computer for this tile. Enable Remote Desktop on that computer first.";
+    alert.informativeText=@"Set up the remote computer for this tile. Enable its RDP server or Remote Login first.";
     [alert addButtonWithTitle:@"Save"]; [alert addButtonWithTitle:@"Cancel"];
     QDFlippedView *form=[[QDFlippedView alloc] initWithFrame:NSMakeRect(0,0,490,396)];
     NSArray *labels=@[@"Name",@"Host",@"Port",@"Username",@"Domain",@"Password"];
@@ -425,9 +510,8 @@ static NSButton *Button(NSString *title, id target, SEL action) {
     if (self.quitting) return NSTerminateLater;
     BOOL busy=NO;
     for (QDTile *tile in self.tiles) if (tile.session.state==QDConnected || tile.session.state==QDConnecting || tile.session.state==QDStopping) busy=YES;
-    if (!busy) return NSTerminateNow;
     self.quitting=YES; [self disconnectAll:nil];
     if (self.activeAlert) [self.window endSheet:self.activeAlert.window returnCode:NSModalResponseCancel];
-    [self.prompts removeAllObjects]; return NSTerminateLater;
+    [self.prompts removeAllObjects]; return busy ? NSTerminateLater : NSTerminateNow;
 }
 @end
